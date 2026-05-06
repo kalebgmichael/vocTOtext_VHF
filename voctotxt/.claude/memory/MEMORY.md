@@ -1,0 +1,1 @@
+- [Docker compose command preference](feedback_docker_command.md) — Always use `docker compose -f docker-compose.local.yml` for all Docker operations

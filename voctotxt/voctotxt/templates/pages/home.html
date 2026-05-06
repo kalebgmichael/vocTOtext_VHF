@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+{% block navbar %}{% endblock navbar %}
+{% block title %}voiceTOtext — Live Transcription
+{%endblock title %}
+{% block content %}
+<div class="row justify-content-center mt-4">
+  <div class="col-lg-8">
+    {# ── Radio Stream ── #}
+    <h2 class="mb-3">Marine VHF Radio — Live Feed</h2>
+
+    <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
+      <span class="fw-semibold me-1">Radio:</span>
+      <span id="radioBadge" class="badge bg-secondary fs-6">Stopped</span>
+      <span
+        id="radioSourceBadge"
+        class="badge bg-info text-dark fs-6"
+        style="display: none"
+      ></span>
+      <button id="radioStartBtn" class="btn btn-success btn-sm ms-2">
+        &#9654; Start
+      </button>
+      <button id="radioStopBtn" class="btn btn-danger btn-sm" disabled>
+        &#9646;&#9646; Stop
+      </button>
+      <button id="radioAudioBtn" class="btn btn-outline-primary btn-sm">
+        &#128266; Enable Audio
+      </button>
+    </div>
+
+    <div class="mb-1">
+      <label for="radioTranscript" class="form-label fw-semibold"
+        >Radio Transcript</label
+      >
+      <textarea
+        id="radioTranscript"
+        class="form-control"
+        rows="8"
+        readonly
+        placeholder="Radio transmissions will appear here…"
+      ></textarea>
+    </div>
+    <div class="mb-4 text-end">
+      <button
+        class="btn btn-outline-secondary btn-sm"
+        onclick="document.getElementById('radioTranscript').value = ''"
+      >
+        Clear
+      </button>
+    </div>
+  </div>
+</div>
+{% endblock content %}
+{% block inline_javascript %}
+<script>
+  window.addEventListener("DOMContentLoaded", () => {
+    // ── Radio stream (auto-connects, reconnects on close) ────────────────────
+    const radioTranscript = document.getElementById("radioTranscript");
+    const radioBadge      = document.getElementById("radioBadge");
+    const radioSourceBadge = document.getElementById("radioSourceBadge");
+    const radioAudioBtn   = document.getElementById("radioAudioBtn");
+    const radioStartBtn   = document.getElementById("radioStartBtn");
+    const radioStopBtn    = document.getElementById("radioStopBtn");
+
+    const SOURCE_LABELS = { audio_device: "Audio Device", ip_stream: "IP Stream", udp: "UDP" };
+    const RADIO_SAMPLE_RATE = 16000;
+
+    let radioWs = null;
+    let running = false;
+    let radioAudioCtx = null;
+    let radioNextStart = 0;
+    let audioEnabled = false;
+
+    function setRunningUI(active) {
+      radioStartBtn.disabled = active;
+      radioStopBtn.disabled  = !active;
+    }
+
+    radioStartBtn.addEventListener("click", () => {
+      if (running) return;
+      running = true;
+      setRunningUI(true);
+      connectRadio();
+    });
+
+    radioStopBtn.addEventListener("click", () => {
+      running = false;
+      setRunningUI(false);
+      if (radioWs) { radioWs.onclose = null; radioWs.close(); radioWs = null; }
+      radioBadge.textContent = "Stopped";
+      radioBadge.className   = "badge bg-secondary fs-6";
+      radioSourceBadge.style.display = "none";
+    });
+
+    radioAudioBtn.addEventListener("click", () => {
+      audioEnabled = !audioEnabled;
+      if (audioEnabled) {
+        radioAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RADIO_SAMPLE_RATE });
+        radioNextStart = radioAudioCtx.currentTime;
+        radioAudioBtn.textContent = "🔇 Disable Audio";
+        radioAudioBtn.classList.replace("btn-outline-primary", "btn-primary");
+      } else {
+        if (radioAudioCtx) { radioAudioCtx.close(); radioAudioCtx = null; }
+        radioNextStart = 0;
+        radioAudioBtn.textContent = "🔊 Enable Audio";
+        radioAudioBtn.classList.replace("btn-primary", "btn-outline-primary");
+      }
+    });
+
+    function scheduleRadioAudio(arrayBuffer) {
+      if (!audioEnabled || !radioAudioCtx || radioAudioCtx.state === "closed") return;
+      const int16 = new Int16Array(arrayBuffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+      const buf = radioAudioCtx.createBuffer(1, float32.length, RADIO_SAMPLE_RATE);
+      buf.copyToChannel(float32, 0);
+      const src = radioAudioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(radioAudioCtx.destination);
+      const start = Math.max(radioAudioCtx.currentTime, radioNextStart);
+      src.start(start);
+      radioNextStart = start + buf.duration;
+    }
+
+    function connectRadio() {
+      if (!running) return;
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      radioWs = new WebSocket(`${proto}//${location.host}/ws/transcribe/radio/`);
+      radioWs.binaryType = "arraybuffer";
+
+      radioBadge.textContent = "Connecting…";
+      radioBadge.className   = "badge bg-warning text-dark fs-6";
+      radioSourceBadge.style.display = "none";
+
+      radioWs.onmessage = (e) => {
+        if (e.data instanceof ArrayBuffer) { scheduleRadioAudio(e.data); return; }
+        const data = JSON.parse(e.data);
+        if (data.error) { radioBadge.textContent = "Error: " + data.error; radioBadge.className = "badge bg-danger fs-6"; return; }
+        if (data.status === "connected") {
+          radioBadge.textContent = "Listening";
+          radioBadge.className   = "badge bg-success fs-6";
+          radioSourceBadge.textContent = SOURCE_LABELS[data.source] ?? data.source;
+          radioSourceBadge.style.display = "inline";
+        }
+        if (data.text) {
+          const sep = radioTranscript.value ? "\n" : "";
+          radioTranscript.value += sep + data.text;
+          radioTranscript.scrollTop = radioTranscript.scrollHeight;
+        }
+      };
+
+      radioWs.onclose = () => {
+        if (!running) return;
+        radioBadge.textContent = "Reconnecting…";
+        radioBadge.className   = "badge bg-secondary fs-6";
+        radioSourceBadge.style.display = "none";
+        setTimeout(connectRadio, 3000);
+      };
+
+      radioWs.onerror = () => { radioBadge.textContent = "Connection error"; radioBadge.className = "badge bg-danger fs-6"; };
+    }
+  });
+</script>
+{% endblock inline_javascript %}

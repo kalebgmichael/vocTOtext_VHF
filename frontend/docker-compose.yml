@@ -1,0 +1,10 @@
+services:
+  frontend:
+    build: .
+    image: voctotxt_frontend
+    container_name: voctotxt_frontend
+    volumes:
+      - .:/app
+      - /app/node_modules
+    ports:
+      - '5173:5173'

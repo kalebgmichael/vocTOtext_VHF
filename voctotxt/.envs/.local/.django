@@ -1,0 +1,25 @@
+# General
+# ------------------------------------------------------------------------------
+USE_DOCKER=yes
+IPYTHONDIR=/app/.ipython
+# Redis
+# ------------------------------------------------------------------------------
+REDIS_URL=redis://redis:6379/0
+
+# Celery
+# ------------------------------------------------------------------------------
+
+# Flower
+CELERY_FLOWER_USER=debug
+CELERY_FLOWER_PASSWORD=debug
+
+# Radio transcription
+# ------------------------------------------------------------------------------
+# Primary: USB/hardware audio interface — set to device name substring or index.
+# Example values: "USB Audio", "Yaesu", "Icom", "1"
+# Leave blank to skip hardware capture and fall back to RADIO_STREAM_URL.
+RADIO_AUDIO_DEVICE= ""
+
+# Fallback: network/IP audio stream (used when RADIO_AUDIO_DEVICE is blank or not found).
+# Example values: "http://192.168.1.100:8080/audio", "rtsp://192.168.1.100/stream"
+RADIO_STREAM_URL= ""

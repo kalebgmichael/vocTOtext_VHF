@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "MCP_DOCKER": {
+      "command": "docker",
+      "args": ["mcp", "gateway", "run"],
+      "type": "stdio"
+    },
+    "vhf-transcribe": {
+      "type": "http",
+      "url": "http://localhost:8001/mcp"
+    }
+  }
+}

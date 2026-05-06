@@ -1,0 +1,7 @@
+vhf-transcribe:
+  description: Transcribe audio files from temp directory using local VHF faster-whisper API.
+  title: VHF Audio Transcription
+  type: remote
+  remote:
+    transport_type: streamable-http
+    url: http://localhost:8001/mcp
