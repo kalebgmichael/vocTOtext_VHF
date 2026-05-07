@@ -76,7 +76,7 @@ def _denoise(audio: np.ndarray, samplerate: int) -> np.ndarray:
     enhanced = enhanced.detach().cpu()
     if samplerate != df_sr:
         enhanced = torchaudio.functional.resample(enhanced, df_sr, samplerate)
-    return enhanced.squeeze(0).numpy()
+    return enhanced.squeeze(0).cpu().numpy()
 
 
 def _amplify_pcm(raw: bytes, db: float = 6.0) -> bytes:
@@ -181,7 +181,11 @@ class RadioTranscribeConsumer(AsyncWebsocketConsumer):
                 # Transcription buffer stores the original (non-amplified) bytes so
                 # DeepFilterNet sees correct signal levels for its noise estimation.
                 amplified = _amplify_pcm(data)
-                await self.send(bytes_data=amplified)
+                try:
+                    await self.send(bytes_data=amplified)
+                except Exception as exc:
+                    logger.warning("WebSocket send failed, closing loop: %s", exc)
+                    break
                 audio_buffer.append(data)
 
                 # Silence gate is checked on amplified signal for better sensitivity.
@@ -196,9 +200,17 @@ class RadioTranscribeConsumer(AsyncWebsocketConsumer):
                     raw = b"".join(audio_buffer)
                     audio_buffer = []
                     silence_accum = 0
-                    text = await asyncio.to_thread(_transcribe_bytes, raw, samplerate)
+                    try:
+                        text = await asyncio.to_thread(_transcribe_bytes, raw, samplerate)
+                    except Exception as exc:
+                        logger.error("Transcription error: %s", exc)
+                        text = ""
                     if text and self._active:
-                        await self.send(text_data=json.dumps({"text": text, "source": "udp"}))
+                        try:
+                            await self.send(text_data=json.dumps({"text": text, "source": "udp"}))
+                        except Exception as exc:
+                            logger.warning("WebSocket text send failed, closing loop: %s", exc)
+                            break
         except asyncio.CancelledError:
             raise
         finally:
