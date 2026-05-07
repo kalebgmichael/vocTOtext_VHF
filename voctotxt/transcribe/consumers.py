@@ -12,6 +12,9 @@ from scipy.signal import butter, sosfilt
 
 logger = logging.getLogger(__name__)
 
+# Computed once at import time — avoids repeated driver queries in hot paths.
+_CUDA = torch.cuda.is_available()
+
 # ── Model singletons ─────────────────────────────────────────────────────────
 
 _WHISPER_MODEL = None
@@ -22,8 +25,8 @@ _DF_STATE = None
 def _get_whisper():
     global _WHISPER_MODEL
     if _WHISPER_MODEL is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "int8_float16" if device == "cuda" else "int8"
+        device = "cuda" if _CUDA else "cpu"
+        compute_type = "int8_float16" if _CUDA else "int8"
         logger.info("Loading faster-whisper large-v3 on %s (compute=%s)", device, compute_type)
         _WHISPER_MODEL = WhisperModel(
             "large-v3",
@@ -41,19 +44,27 @@ def _get_df():
         from df.enhance import init_df  # noqa: PLC0415
 
         _DF_MODEL, _DF_STATE, _ = init_df()
-        if torch.cuda.is_available():
+        if _CUDA:
             _DF_MODEL = _DF_MODEL.to("cuda")
-        logger.info("DeepFilterNet loaded on %s", "cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("DeepFilterNet loaded on %s", "cuda" if _CUDA else "cpu")
     return _DF_MODEL, _DF_STATE
 
 
 # ── Audio helpers ─────────────────────────────────────────────────────────────
 
+# Cached per samplerate — butter() is pure-math but non-trivial; no reason to
+# recompute on every transcription call when samplerate never changes at runtime.
+_BANDPASS_SOS: dict[int, np.ndarray] = {}
+
+
 def _bandpass_radio(audio: np.ndarray, samplerate: int) -> np.ndarray:
     """4th-order Butterworth bandpass 300–3400 Hz — isolates radio voice band."""
-    nyq = samplerate / 2.0
-    sos = butter(4, [300.0 / nyq, min(3400.0 / nyq, 0.99)], btype="band", output="sos")
-    return sosfilt(sos, audio).astype(np.float32)
+    if samplerate not in _BANDPASS_SOS:
+        nyq = samplerate / 2.0
+        _BANDPASS_SOS[samplerate] = butter(
+            4, [300.0 / nyq, min(3400.0 / nyq, 0.99)], btype="band", output="sos"
+        )
+    return sosfilt(_BANDPASS_SOS[samplerate], audio).astype(np.float32)
 
 
 def _denoise(audio: np.ndarray, samplerate: int) -> np.ndarray:
@@ -62,7 +73,7 @@ def _denoise(audio: np.ndarray, samplerate: int) -> np.ndarray:
 
     model, df_state = _get_df()
     df_sr = df_state.sr()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if _CUDA else "cpu"
 
     # copy() prevents torch from sharing memory with the numpy array
     t = torch.from_numpy(audio.copy()).float().unsqueeze(0)  # [1, T]
@@ -70,25 +81,23 @@ def _denoise(audio: np.ndarray, samplerate: int) -> np.ndarray:
         t = torchaudio.functional.resample(t, samplerate, df_sr)
     t = t.to(device)
 
-    enhanced = enhance(model, df_state, t)
-
-    # detach from autograd graph, move to CPU before any further ops
-    enhanced = enhanced.detach().cpu()
+    enhanced = enhance(model, df_state, t).detach().cpu()
     if samplerate != df_sr:
         enhanced = torchaudio.functional.resample(enhanced, df_sr, samplerate)
-    return enhanced.squeeze(0).cpu().numpy()
+    return enhanced.squeeze(0).numpy()
 
 
-def _amplify_pcm(raw: bytes, db: float = 6.0) -> bytes:
+def _amplify_and_rms(raw: bytes, db: float = 6.0) -> tuple[bytes, float]:
+    """Amplify PCM in one pass, return (amplified_bytes, rms_of_amplified).
+
+    Merges the former _amplify_pcm + _rms_bytes to avoid two frombuffer calls
+    per UDP packet on the same data.
+    """
     gain = 10 ** (db / 20)
     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-    samples = np.clip(samples * gain, -32768, 32767)
-    return samples.astype(np.int16).tobytes()
-
-
-def _rms_bytes(raw: bytes) -> float:
-    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    return float(np.sqrt(np.mean(samples ** 2)))
+    amplified = np.clip(samples * gain, -32768, 32767)
+    rms = float(np.sqrt(np.mean((amplified / 32768.0) ** 2)))
+    return amplified.astype(np.int16).tobytes(), rms
 
 
 # ── UDP protocol ──────────────────────────────────────────────────────────────
@@ -148,17 +157,27 @@ class RadioTranscribeConsumer(AsyncWebsocketConsumer):
 
         bytes_per_sec = samplerate * 2  # int16 mono
 
-        # 30 s = Whisper's native context window; aligning to it gives best accuracy.
-        # 2 s minimum guarantees we have at least a short complete phrase.
-        # 1 s silence gate: PTT drop causes near-instant squelch, so 1 s reliably
-        # signals end-of-transmission while not cutting natural mid-sentence pauses
-        # (which are typically 0.2–0.4 s on radio).
-        max_buf_bytes = bytes_per_sec * 30
-        min_buf_bytes = bytes_per_sec * 2
-        silence_drain = bytes_per_sec * 1
+        # Silence gate is the primary flush path — fires at PTT release for clean
+        # transmissions and always yields a semantically complete chunk.
+        # max_buf_bytes is the fallback for noisy conditions where RMS never drops
+        # below threshold.  20 s captures virtually all complete marine VHF messages
+        # while cutting worst-case latency from ~35 s (30 s + GPU) to ~23 s.
+        # Cutting to 8 s would slice active transmissions mid-sentence and give
+        # Whisper broken context — worse accuracy for no benefit in the common case.
+        # 1 s minimum avoids flushing on a noise burst shorter than a real phrase.
+        # 500 ms silence gate — PTT squelch drops hard; natural mid-sentence pauses
+        # are < 300 ms so 500 ms reliably marks end-of-transmission (was 1 s).
+        max_buf_bytes  = bytes_per_sec * 20
+        min_buf_bytes  = bytes_per_sec * 1
+        silence_drain  = bytes_per_sec // 2
+
+        # 80 ms audio batch before each WebSocket send.  Bundles ~4 UDP packets
+        # into one message, cutting send frequency ~4x and giving the browser
+        # larger, jitter-stable chunks for gapless Web Audio scheduling.
+        audio_batch_threshold = bytes_per_sec * 80 // 1000
 
         queue: asyncio.Queue[bytes] = asyncio.Queue()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
             lambda: _UDPProtocol(queue),
             local_addr=(udp_ip, udp_port),
@@ -168,7 +187,24 @@ class RadioTranscribeConsumer(AsyncWebsocketConsumer):
         await self.send(text_data=json.dumps({"status": "connected", "source": "udp"}))
 
         audio_buffer: list[bytes] = []
+        total_bytes   = 0
         silence_accum = 0
+        audio_batch:  list[bytes] = []
+        audio_batch_bytes = 0
+
+        async def _flush_audio() -> bool:
+            """Send accumulated audio batch. Returns False on WebSocket error."""
+            nonlocal audio_batch, audio_batch_bytes
+            if not audio_batch:
+                return True
+            try:
+                await self.send(bytes_data=b"".join(audio_batch))
+                audio_batch = []
+                audio_batch_bytes = 0
+                return True
+            except Exception as exc:
+                logger.warning("WebSocket audio send failed: %s", exc)
+                return False
 
         try:
             while self._active:
@@ -180,25 +216,33 @@ class RadioTranscribeConsumer(AsyncWebsocketConsumer):
                 # Browser gets amplified audio for real-time monitoring.
                 # Transcription buffer stores the original (non-amplified) bytes so
                 # DeepFilterNet sees correct signal levels for its noise estimation.
-                amplified = _amplify_pcm(data)
-                try:
-                    await self.send(bytes_data=amplified)
-                except Exception as exc:
-                    logger.warning("WebSocket send failed, closing loop: %s", exc)
-                    break
-                audio_buffer.append(data)
+                amplified, rms = _amplify_and_rms(data)
 
-                # Silence gate is checked on amplified signal for better sensitivity.
-                if _rms_bytes(amplified) < _RMS_THRESHOLD:
+                audio_batch.append(amplified)
+                audio_batch_bytes += len(amplified)
+                if audio_batch_bytes >= audio_batch_threshold:
+                    if not await _flush_audio():
+                        break
+
+                audio_buffer.append(data)
+                total_bytes += len(data)
+
+                # Silence gate checked on amplified signal for better sensitivity.
+                if rms < _RMS_THRESHOLD:
                     silence_accum += len(amplified)
                 else:
                     silence_accum = 0
 
-                total = sum(len(b) for b in audio_buffer)
-                end_of_tx = silence_accum >= silence_drain and total >= min_buf_bytes
-                if total >= max_buf_bytes or end_of_tx:
+                end_of_tx = silence_accum >= silence_drain and total_bytes >= min_buf_bytes
+                if total_bytes >= max_buf_bytes or end_of_tx:
+                    # Flush remaining audio so browser hears the full transmission
+                    # before the transcription text arrives.
+                    if not await _flush_audio():
+                        break
+
                     raw = b"".join(audio_buffer)
                     audio_buffer = []
+                    total_bytes   = 0
                     silence_accum = 0
                     try:
                         text = await asyncio.to_thread(_transcribe_bytes, raw, samplerate)
@@ -209,7 +253,7 @@ class RadioTranscribeConsumer(AsyncWebsocketConsumer):
                         try:
                             await self.send(text_data=json.dumps({"text": text, "source": "udp"}))
                         except Exception as exc:
-                            logger.warning("WebSocket text send failed, closing loop: %s", exc)
+                            logger.warning("WebSocket text send failed: %s", exc)
                             break
         except asyncio.CancelledError:
             raise
