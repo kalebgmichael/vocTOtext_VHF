@@ -7,5 +7,6 @@ app_name = "transcribe"
 urlpatterns = [
     path("upload/", views.transcribe_upload, name="transcribe-upload"),
     path("record/", views.transcribe_record, name="transcribe-record"),
+    path("audio/", views.transcribe_audio, name="transcribe-audio"),
     path("live/", views.transcribe_live_chunk, name="transcribe-live"),
 ]

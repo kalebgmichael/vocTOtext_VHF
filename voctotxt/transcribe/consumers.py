@@ -261,6 +261,74 @@ class RadioTranscribeConsumer(AsyncWebsocketConsumer):
             transport.close()
 
 
+# ── File playback ─────────────────────────────────────────────────────────────
+
+class PlaybackConsumer(AsyncWebsocketConsumer):
+    """Streams the last uploaded WAV file as raw int16 PCM chunks.
+
+    Mirrors the binary audio format sent by RadioTranscribeConsumer so the
+    frontend can reuse scheduleAudio() without any changes.
+    """
+
+    async def connect(self):
+        await self.accept()
+        self._active = True
+        self._task = asyncio.ensure_future(self._stream())
+
+    async def disconnect(self, close_code):
+        self._active = False
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+
+    async def receive(self, bytes_data=None, text_data=None):
+        pass
+
+    async def _stream(self):
+        import os
+        import wave as _wave
+
+        media_root = settings.MEDIA_ROOT
+        last_upload = os.path.join(media_root, "uploads", ".last_upload")
+        try:
+            path = open(last_upload).read().strip()
+            if not os.path.isfile(path):
+                path = None
+        except FileNotFoundError:
+            path = None
+
+        if not path:
+            await self.send(text_data=json.dumps({"error": "No uploaded file"}))
+            await self.close()
+            return
+
+        samplerate = int(getattr(settings, "RADIO_SAMPLE_RATE", 16_000))
+        frames_per_chunk = samplerate * 80 // 1000  # 80 ms per chunk
+
+        try:
+            with _wave.open(path, "rb") as wf:
+                await self.send(text_data=json.dumps({"status": "playing"}))
+                while self._active:
+                    data = wf.readframes(frames_per_chunk)
+                    if not data:
+                        break
+                    await self.send(bytes_data=data)
+                    await asyncio.sleep(0.08)
+            if self._active:
+                await self.send(text_data=json.dumps({"status": "done"}))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("PlaybackConsumer stream error: %s", exc)
+        finally:
+            try:
+                await self.close()
+            except Exception:
+                pass
+
+
 # ── Transcription ─────────────────────────────────────────────────────────────
 
 def _transcribe_bytes(raw: bytes, samplerate: int) -> str:

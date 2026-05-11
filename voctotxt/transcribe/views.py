@@ -1,11 +1,13 @@
-import glob
 import logging
 import os
 import tempfile
+import wave
 
 import numpy as np
 import torch
 import torchaudio
+from django.conf import settings
+from django.http import FileResponse
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.decorators import permission_classes
@@ -19,15 +21,29 @@ from .consumers import _get_whisper
 
 logger = logging.getLogger(__name__)
 
-# Fixed upload path — Postman saves here, Record button reads from here.
-_UPLOAD_DIR    = tempfile.gettempdir()
-_UPLOAD_PREFIX = "vhf_radio_latest"
+# Permanent upload dir — survives restarts, stored under MEDIA_ROOT/uploads/
+_UPLOAD_DIR     = os.path.join(settings.MEDIA_ROOT, "uploads")
+_LAST_UPLOAD    = os.path.join(_UPLOAD_DIR, ".last_upload")
+os.makedirs(_UPLOAD_DIR, exist_ok=True)
 
 
 def _stored_upload_path() -> str | None:
-    """Return path of latest uploaded file, or None if none exists."""
-    matches = glob.glob(os.path.join(_UPLOAD_DIR, f"{_UPLOAD_PREFIX}.*"))
-    return matches[0] if matches else None
+    """Return path of the last uploaded file, or None if none exists."""
+    try:
+        path = open(_LAST_UPLOAD).read().strip()
+        return path if os.path.isfile(path) else None
+    except FileNotFoundError:
+        return None
+
+
+def _pcm_to_wav(pcm_path: str, wav_path: str, sample_rate: int = 16_000) -> None:
+    """Convert raw int16 mono PCM to a proper WAV file."""
+    raw = open(pcm_path, "rb").read()
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)   # int16 = 2 bytes per sample
+        wf.setframerate(sample_rate)
+        wf.writeframes(raw)
 
 
 def _transcribe_wav_pipeline(path: str, language: str | None = None) -> dict:
@@ -70,21 +86,31 @@ def _transcribe_wav_pipeline(path: str, language: str | None = None) -> dict:
         audio = t.squeeze(0).cpu().numpy()
 
     model = _get_whisper()
-    segments, info = model.transcribe(
-        audio,
-        language=language,
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
-        temperature=0.0,
-        condition_on_previous_text=False,
-        no_speech_threshold=0.6,
-        compression_ratio_threshold=2.4,
-    )
+
+    def _run_transcribe(vad: bool) -> tuple:
+        segs, inf = model.transcribe(
+            audio,
+            language=language,
+            beam_size=5,
+            vad_filter=vad,
+            vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=400) if vad else None,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.8,
+            compression_ratio_threshold=2.4,
+        )
+        return list(segs), inf
+
+    seg_objs, info = _run_transcribe(vad=True)
+    # Retry without VAD if nothing was found — VAD can be too aggressive on radio audio
+    if not seg_objs:
+        logger.info("VAD found no segments, retrying without VAD filter")
+        seg_objs, info = _run_transcribe(vad=False)
+
     seg_list = [
         {"start": s.start, "end": s.end, "text": s.text.strip()}
-        for s in segments
-        if s.no_speech_prob < 0.6
+        for s in seg_objs
+        if s.no_speech_prob < 0.8
     ]
     full_text = " ".join(s["text"] for s in seg_list if s["text"])
     return {
@@ -124,23 +150,39 @@ def _whisper_transcribe_file(path: str, language: str | None = None) -> dict:
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def transcribe_upload(request):
-    """Save uploaded audio file. Does not transcribe — call /record/ to transcribe."""
+    """Save uploaded audio file. PCM is converted to WAV automatically. Call /record/ to transcribe."""
     if "audio_file" not in request.FILES:
         return Response({"error": "No audio file provided"}, status=status.HTTP_400_BAD_REQUEST)
 
     audio_file = request.FILES["audio_file"]
-    suffix = os.path.splitext(audio_file.name)[1] or ".wav"
+    name = os.path.basename(audio_file.name)
+    ext = os.path.splitext(name)[1].lower()
+    if not ext:
+        name += ".pcm"
+        ext = ".pcm"
 
-    # Remove any previous upload before saving new one.
-    for old in glob.glob(os.path.join(_UPLOAD_DIR, f"{_UPLOAD_PREFIX}.*")):
-        os.remove(old)
+    dest = os.path.join(_UPLOAD_DIR, name)
 
-    dest = os.path.join(_UPLOAD_DIR, f"{_UPLOAD_PREFIX}{suffix}")
+    if os.path.isfile(dest):
+        return Response({"error": f"{name} already exists"}, status=status.HTTP_409_CONFLICT)
+
     with open(dest, "wb") as f:
         for chunk in audio_file.chunks():
             f.write(chunk)
 
-    return Response({"status": "uploaded", "filename": audio_file.name}, status=status.HTTP_200_OK)
+    if ext == ".pcm":
+        sample_rate = int(getattr(settings, "RADIO_SAMPLE_RATE", 16_000))
+        wav_name = os.path.splitext(name)[0] + ".wav"
+        wav_dest = os.path.join(_UPLOAD_DIR, wav_name)
+        _pcm_to_wav(dest, wav_dest, sample_rate)
+        os.remove(dest)
+        dest = wav_dest
+        name = wav_name
+
+    with open(_LAST_UPLOAD, "w") as f:
+        f.write(dest)
+
+    return Response({"status": "uploaded", "filename": name}, status=status.HTTP_200_OK)
 
 
 @api_view(["POST"])
@@ -164,11 +206,22 @@ def transcribe_record(request):
                 "language_probability": result["language_probability"],
                 "duration": result["duration"],
                 "segments": result["segments"],
+                "audio_url": "/api/transcribe/audio/",
             },
             status=status.HTTP_200_OK,
         )
     except Exception as e:  # noqa: BLE001
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def transcribe_audio(request):
+    """Stream the last uploaded audio file."""
+    path = _stored_upload_path()
+    if not path:
+        return Response({"error": "No uploaded file found"}, status=status.HTTP_404_NOT_FOUND)
+    return FileResponse(open(path, "rb"), content_type="audio/wav", filename=os.path.basename(path))
 
 
 @api_view(["POST"])

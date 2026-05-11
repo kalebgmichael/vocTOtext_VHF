@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-const WS_RADIO_URL = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/transcribe/radio/`;
+const WS_RADIO_URL    = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/transcribe/radio/`;
+const WS_PLAYBACK_URL = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/transcribe/playback/`;
 const RADIO_SAMPLE_RATE = 16000;
 
 const SOURCE_LABELS = { audio_device: 'Audio Device', ip_stream: 'IP Stream', udp: 'UDP' };
@@ -15,6 +16,7 @@ export default function App() {
   const [recordStatus, setRecordStatus]       = useState(null);
 
   const radioWsRef    = useRef(null);
+  const playbackWsRef = useRef(null);
   const radioBodyRef  = useRef(null);
   const runningRef    = useRef(false);
   const reconnectRef  = useRef(null);
@@ -42,12 +44,18 @@ export default function App() {
     nextStartRef.current = start + buf.duration;
   }
 
-  function handleAudioToggle() {
-    if (!audioEnabled) {
+  function ensureAudioCtx() {
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
       const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RADIO_SAMPLE_RATE });
       audioCtxRef.current = ctx;
       nextStartRef.current = ctx.currentTime;
       setAudioEnabled(true);
+    }
+  }
+
+  function handleAudioToggle() {
+    if (!audioEnabled) {
+      ensureAudioCtx();
     } else {
       audioCtxRef.current?.close();
       audioCtxRef.current = null;
@@ -68,9 +76,9 @@ export default function App() {
     ws.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer) { scheduleAudio(e.data); return; }
       const data = JSON.parse(e.data);
-      if (data.error)           { setRadioStatus('error'); return; }
-      if (data.status === 'connected') { setRadioStatus('listening'); setRadioSource(data.source); }
-      if (data.text)            setRadioTranscript(prev => prev + (prev ? '\n' : '') + data.text);
+      if (data.error)                    { setRadioStatus('error'); return; }
+      if (data.status === 'connected')   { setRadioStatus('listening'); setRadioSource(data.source); }
+      if (data.text)                     setRadioTranscript(prev => prev + (prev ? '\n' : '') + data.text);
     };
 
     ws.onclose = () => {
@@ -89,16 +97,40 @@ export default function App() {
   }
 
   async function handleRecord() {
+    // Close any in-progress playback
+    if (playbackWsRef.current) {
+      playbackWsRef.current.onclose = null;
+      playbackWsRef.current.close();
+      playbackWsRef.current = null;
+    }
+
     setRecording(true);
     setRecordStatus('processing');
+
+    // Ensure audio context exists (Record click is a valid user gesture)
+    ensureAudioCtx();
+
+    // Open playback stream and transcription POST in parallel
+    const playbackWs = new WebSocket(WS_PLAYBACK_URL);
+    playbackWs.binaryType = 'arraybuffer';
+    playbackWsRef.current = playbackWs;
+
+    playbackWs.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) { scheduleAudio(e.data); return; }
+      // text frames are status/error — nothing to display
+    };
+    playbackWs.onclose = () => { playbackWsRef.current = null; };
+
     try {
       const resp = await fetch('/api/transcribe/record/', { method: 'POST' });
       const data = await resp.json();
-      if (data.transcription) {
+      if (data.error) {
+        setRecordStatus('error: ' + data.error);
+      } else if (data.transcription) {
         setRadioTranscript(prev => prev + (prev ? '\n' : '') + '[File] ' + data.transcription);
         setRecordStatus('done');
       } else {
-        setRecordStatus('error: ' + (data.error ?? 'empty result'));
+        setRecordStatus('no speech detected');
       }
     } catch {
       setRecordStatus('failed');
