@@ -11,6 +11,8 @@ export default function App() {
   const [radioStatus, setRadioStatus]         = useState('stopped');
   const [radioSource, setRadioSource]         = useState(null);
   const [radioTranscript, setRadioTranscript] = useState('');
+  const [recording, setRecording]             = useState(false);
+  const [recordStatus, setRecordStatus]       = useState(null);
 
   const radioWsRef    = useRef(null);
   const radioBodyRef  = useRef(null);
@@ -86,6 +88,25 @@ export default function App() {
     connect();
   }
 
+  async function handleRecord() {
+    setRecording(true);
+    setRecordStatus('processing');
+    try {
+      const resp = await fetch('/api/transcribe/record/', { method: 'POST' });
+      const data = await resp.json();
+      if (data.transcription) {
+        setRadioTranscript(prev => prev + (prev ? '\n' : '') + '[File] ' + data.transcription);
+        setRecordStatus('done');
+      } else {
+        setRecordStatus('error: ' + (data.error ?? 'empty result'));
+      }
+    } catch {
+      setRecordStatus('failed');
+    } finally {
+      setRecording(false);
+    }
+  }
+
   function handleStop() {
     runningRef.current = false;
     setRunning(false);
@@ -105,9 +126,17 @@ export default function App() {
           </div>
           <div className="panel-actions">
             {!running
-              ? <button className="start-btn" onClick={handleStart}>▶ Start</button>
+              ? <button className="start-btn" onClick={handleStart}>▶ Start Live</button>
               : <button className="stop-btn"  onClick={handleStop}>⏹ Stop</button>
             }
+            <button className="start-btn" onClick={handleRecord} disabled={recording}>
+              {recording ? '⏳ Processing…' : '⏺ Record'}
+            </button>
+            {recordStatus && (
+              <span style={{ fontSize: '0.75rem', color: recordStatus === 'done' ? 'var(--clr-active)' : '#e74c3c' }}>
+                {recordStatus}
+              </span>
+            )}
             <button
               className={audioEnabled ? 'audio-btn audio-btn--on' : 'audio-btn'}
               onClick={handleAudioToggle}
