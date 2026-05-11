@@ -305,17 +305,30 @@ class PlaybackConsumer(AsyncWebsocketConsumer):
             return
 
         samplerate = int(getattr(settings, "RADIO_SAMPLE_RATE", 16_000))
-        frames_per_chunk = samplerate * 80 // 1000  # 80 ms per chunk
+        # int16 mono: 2 bytes per sample, 80 ms per chunk
+        bytes_per_chunk = samplerate * 2 * 80 // 1000
 
         try:
-            with _wave.open(path, "rb") as wf:
-                await self.send(text_data=json.dumps({"status": "playing"}))
-                while self._active:
-                    data = wf.readframes(frames_per_chunk)
-                    if not data:
-                        break
-                    await self.send(bytes_data=data)
-                    await asyncio.sleep(0.08)
+            await self.send(text_data=json.dumps({"status": "playing"}))
+            if path.lower().endswith(".pcm"):
+                # Raw int16 mono — same binary format as live UDP stream
+                with open(path, "rb") as f:
+                    while self._active:
+                        data = f.read(bytes_per_chunk)
+                        if not data:
+                            break
+                        await self.send(bytes_data=data)
+                        await asyncio.sleep(0.08)
+            else:
+                # WAV: read raw PCM frames (strips WAV header automatically)
+                with _wave.open(path, "rb") as wf:
+                    frames_per_chunk = bytes_per_chunk // (wf.getsampwidth() * wf.getnchannels())
+                    while self._active:
+                        data = wf.readframes(frames_per_chunk)
+                        if not data:
+                            break
+                        await self.send(bytes_data=data)
+                        await asyncio.sleep(0.08)
             if self._active:
                 await self.send(text_data=json.dumps({"status": "done"}))
         except asyncio.CancelledError:

@@ -36,15 +36,6 @@ def _stored_upload_path() -> str | None:
         return None
 
 
-def _pcm_to_wav(pcm_path: str, wav_path: str, sample_rate: int = 16_000) -> None:
-    """Convert raw int16 mono PCM to a proper WAV file."""
-    raw = open(pcm_path, "rb").read()
-    with wave.open(wav_path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)   # int16 = 2 bytes per sample
-        wf.setframerate(sample_rate)
-        wf.writeframes(raw)
-
 
 def _transcribe_wav_pipeline(path: str, language: str | None = None) -> dict:
     """Read audio → bandpass 300-3400 Hz → DeepFilterNet denoise → Whisper.
@@ -170,15 +161,6 @@ def transcribe_upload(request):
         for chunk in audio_file.chunks():
             f.write(chunk)
 
-    if ext == ".pcm":
-        sample_rate = int(getattr(settings, "RADIO_SAMPLE_RATE", 16_000))
-        wav_name = os.path.splitext(name)[0] + ".wav"
-        wav_dest = os.path.join(_UPLOAD_DIR, wav_name)
-        _pcm_to_wav(dest, wav_dest, sample_rate)
-        os.remove(dest)
-        dest = wav_dest
-        name = wav_name
-
     with open(_LAST_UPLOAD, "w") as f:
         f.write(dest)
 
@@ -217,10 +199,24 @@ def transcribe_record(request):
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def transcribe_audio(request):
-    """Stream the last uploaded audio file."""
+    """Stream the last uploaded audio file. PCM is converted to WAV in-memory for playback."""
     path = _stored_upload_path()
     if not path:
         return Response({"error": "No uploaded file found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if path.lower().endswith(".pcm"):
+        import io
+        sample_rate = int(getattr(settings, "RADIO_SAMPLE_RATE", 16_000))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(open(path, "rb").read())
+        buf.seek(0)
+        filename = os.path.splitext(os.path.basename(path))[0] + ".wav"
+        return FileResponse(buf, content_type="audio/wav", filename=filename)
+
     return FileResponse(open(path, "rb"), content_type="audio/wav", filename=os.path.basename(path))
 
 
