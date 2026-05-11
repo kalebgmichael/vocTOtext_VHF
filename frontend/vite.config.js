@@ -9,6 +9,17 @@ export default defineConfig({
     warmup: {
       clientFiles: ['./src/App.jsx'],
     },
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8089',
+        changeOrigin: true,
+      },
+      '/ws': {
+        target: 'ws://127.0.0.1:8089',
+        ws: true,
+        changeOrigin: true,
+      },
+    },
   },
   optimizeDeps: {
     include: ['react', 'react-dom', 'react-dom/client'],
