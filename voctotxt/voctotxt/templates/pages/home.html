@@ -5,7 +5,6 @@
 {% block content %}
 <div class="row justify-content-center mt-4">
   <div class="col-lg-8">
-    {# ── Radio Stream ── #}
     <h2 class="mb-3">Marine VHF Radio — Live Feed</h2>
 
     <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
@@ -17,11 +16,15 @@
         style="display: none"
       ></span>
       <button id="radioStartBtn" class="btn btn-success btn-sm ms-2">
-        &#9654; Start
+        &#9654; Start Live
       </button>
       <button id="radioStopBtn" class="btn btn-danger btn-sm" disabled>
         &#9646;&#9646; Stop
       </button>
+      <button id="recordBtn" class="btn btn-warning btn-sm">
+        &#9711; Record
+      </button>
+      <span id="recordBadge" class="badge bg-secondary fs-6" style="display:none"></span>
       <button id="radioAudioBtn" class="btn btn-outline-primary btn-sm">
         &#128266; Enable Audio
       </button>
@@ -120,6 +123,36 @@
       src.start(start);
       radioNextStart = start + buf.duration;
     }
+
+    // ── Record button — transcribes last file uploaded via Postman ───────────
+    const recordBtn   = document.getElementById("recordBtn");
+    const recordBadge = document.getElementById("recordBadge");
+
+    recordBtn.addEventListener("click", async () => {
+      recordBtn.disabled = true;
+      recordBadge.style.display = "inline";
+      recordBadge.textContent = "Processing…";
+      recordBadge.className = "badge bg-warning text-dark fs-6";
+      try {
+        const resp = await fetch("/api/transcribe/record/", { method: "POST" });
+        const data = await resp.json();
+        if (data.transcription) {
+          const sep = radioTranscript.value ? "\n" : "";
+          radioTranscript.value += sep + "[File] " + data.transcription;
+          radioTranscript.scrollTop = radioTranscript.scrollHeight;
+          recordBadge.textContent = "Done";
+          recordBadge.className = "badge bg-success fs-6";
+        } else {
+          recordBadge.textContent = "Error: " + (data.error ?? "empty result");
+          recordBadge.className = "badge bg-danger fs-6";
+        }
+      } catch (e) {
+        recordBadge.textContent = "Failed";
+        recordBadge.className = "badge bg-danger fs-6";
+      } finally {
+        recordBtn.disabled = false;
+      }
+    });
 
     function connectRadio() {
       if (!running) return;
