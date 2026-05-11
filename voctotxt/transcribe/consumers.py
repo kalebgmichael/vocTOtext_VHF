@@ -84,7 +84,7 @@ def _denoise(audio: np.ndarray, samplerate: int) -> np.ndarray:
     enhanced = enhance(model, df_state, t).detach().cpu()
     if samplerate != df_sr:
         enhanced = torchaudio.functional.resample(enhanced, df_sr, samplerate)
-    return enhanced.squeeze(0).numpy()
+    return enhanced.squeeze(0).cpu().numpy()
 
 
 def _amplify_and_rms(raw: bytes, db: float = 6.0) -> tuple[bytes, float]:
