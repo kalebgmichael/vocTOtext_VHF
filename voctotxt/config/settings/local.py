@@ -14,7 +14,7 @@ SECRET_KEY = env(
     default="w6Ba90qYLB71SYepS1iGutyNwqkOYfQ5Srto2bsV2qGLeOm2lCkfPVfzxO76C1b3",
 )
 # https://docs.djangoproject.com/en/dev/ref/settings/#allowed-hosts
-ALLOWED_HOSTS = ["localhost", "0.0.0.0", "127.0.0.1", "192.168.226.10", "gpu1.peace.labtlclivorno.it"]  # noqa: S104
+ALLOWED_HOSTS = ["localhost", "0.0.0.0", "127.0.0.1", "192.168.226.10", "gpu1.peace.labtlclivorno.it","192.168.137.101"]  # noqa: S104
 
 # CACHES
 # ------------------------------------------------------------------------------
@@ -89,6 +89,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://192.168.226.10:5173",
     "http://192.168.226.10:3089",
     "https://gpu1.peace.labtlclivorno.it",
+    "http://192.168.137.101:5173",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
